@@ -1305,6 +1305,20 @@ export interface GrokBillingSummary {
   failed_windows?: string[]
 }
 
+// DeepSeek /user/balance 单币种余额
+export interface DeepSeekBalanceInfo {
+  currency: string
+  total_balance: string
+  granted_balance: string
+  topped_up_balance: string
+}
+
+// DeepSeek /user/balance 官方响应
+export interface DeepSeekBalance {
+  is_available: boolean
+  balance_infos: DeepSeekBalanceInfo[]
+}
+
 export interface AccountUsageInfo {
   source?: 'passive' | 'active'
   updated_at: string | null
@@ -1334,6 +1348,7 @@ export interface AccountUsageInfo {
   grok_local_usage_7d?: WindowStats | null
   grok_local_usage_monthly?: WindowStats | null
   grok_billing?: GrokBillingSummary | null
+  deepseek_balance?: DeepSeekBalance | null
   subscription_tier?: string
   subscription_tier_raw?: string
   ai_credits?: Array<{

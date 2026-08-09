@@ -20,14 +20,32 @@ import (
 )
 
 // Account management implementations
+func markDeepSeekBalanceSupported(accounts ...*Account) {
+	for _, acct := range accounts {
+		if acct == nil || !IsDeepSeekAccount(acct) {
+			continue
+		}
+		if acct.Extra == nil {
+			acct.Extra = map[string]any{}
+		}
+		acct.Extra["deepseek_balance_supported"] = true
+	}
+}
+
 func (s *adminServiceImpl) ListAccounts(ctx context.Context, page, pageSize int, platform, accountType, status, search string, groupID int64, privacyMode string, sortBy, sortOrder string) ([]Account, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
 	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID, privacyMode)
 	if err != nil {
 		return nil, 0, err
 	}
+	// 注入 DeepSeek 余额能力标记（前端据此展示余额）
+	for i := range accounts {
+		markDeepSeekBalanceSupported(&accounts[i])
+	}
 	return accounts, result.Total, nil
 }
+
+
 
 func (s *adminServiceImpl) ListAccountsForSchedulerScoreFilter(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, error) {
 	if s == nil || s.accountRepo == nil {
@@ -47,7 +65,12 @@ func (s *adminServiceImpl) ListOpenAISchedulableAccountsForSchedulerScore(ctx co
 }
 
 func (s *adminServiceImpl) GetAccount(ctx context.Context, id int64) (*Account, error) {
-	return s.accountRepo.GetByID(ctx, id)
+	acct, err := s.accountRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	markDeepSeekBalanceSupported(acct)
+	return acct, nil
 }
 
 func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([]*Account, error) {

@@ -125,6 +125,8 @@ type UsageCache struct {
 	antigravityFlight singleflight.Group // 防止同一 Antigravity 账号的并发请求击穿缓存
 	openAIProbeCache  sync.Map           // accountID -> time.Time
 	grokProbeCache    sync.Map           // accountID -> last billing probe attempt
+	deepSeekCache     sync.Map           // accountID -> *deepSeekUsageCache
+	deepSeekFlight    singleflight.Group // 防止同一 DeepSeek 账号并发请求击穿缓存
 }
 
 // NewUsageCache 创建 UsageCache 实例
@@ -181,6 +183,12 @@ type AICredit struct {
 }
 
 // UsageInfo 账号使用量信息
+// DeepSeekBalance DeepSeek 账号余额（/user/balance）。
+type DeepSeekBalance struct {
+	IsAvailable  bool                   `json:"is_available"`
+	BalanceInfos []DeepSeekBalanceInfo `json:"balance_infos,omitempty"`
+}
+
 type UsageInfo struct {
 	Source             string         `json:"source,omitempty"`               // "passive" or "active"
 	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`           // 更新时间
@@ -215,6 +223,9 @@ type UsageInfo struct {
 	// ThirtyDay is the official monthly billing window (used/monthlyLimit %).
 	ThirtyDay   *UsageProgress      `json:"thirty_day,omitempty"`
 	GrokBilling *xai.BillingSummary `json:"grok_billing,omitempty"`
+
+	// DeepSeek 账号余额（provider 级 /user/balance）
+	DeepSeekBalance *DeepSeekBalance `json:"deepseek_balance,omitempty"`
 
 	// Antigravity 账号级信息
 	SubscriptionTier    string `json:"subscription_tier,omitempty"`     // 归一化订阅等级: FREE/PRO/ULTRA/UNKNOWN
@@ -297,6 +308,7 @@ type AccountUsageService struct {
 	geminiQuotaService      *GeminiQuotaService
 	antigravityQuotaFetcher *AntigravityQuotaFetcher
 	grokQuotaFetcher        *GrokQuotaFetcher
+	deepSeekQuotaFetcher    *DeepSeekQuotaFetcher
 	grokQuotaService        *GrokQuotaService
 	openAIQuotaService      *OpenAIQuotaService
 	cache                   *UsageCache
@@ -316,6 +328,7 @@ func NewAccountUsageService(
 	grokQuotaFetcher *GrokQuotaFetcher,
 	grokQuotaService *GrokQuotaService,
 	openAIQuotaService *OpenAIQuotaService,
+	deepSeekQuotaFetcher *DeepSeekQuotaFetcher,
 	cache *UsageCache,
 	identityCache IdentityCache,
 	tlsFPProfileService *TLSFingerprintProfileService,
@@ -329,6 +342,7 @@ func NewAccountUsageService(
 		grokQuotaFetcher:        grokQuotaFetcher,
 		grokQuotaService:        grokQuotaService,
 		openAIQuotaService:      openAIQuotaService,
+		deepSeekQuotaFetcher:    deepSeekQuotaFetcher,
 		cache:                   cache,
 		identityCache:           identityCache,
 		tlsFPProfileService:     tlsFPProfileService,
@@ -357,6 +371,15 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 	// passive snapshot that the account table loads on mount.
 	if account.IsSyntheticUITest() && account.IsAnthropicOAuthOrSetupToken() {
 		return s.getPassiveUsageForAccount(ctx, account)
+	}
+
+	// DeepSeek API Key 账号（openai-compatible, base_url 含 deepseek.com）走专属余额查询
+	if s.deepSeekQuotaFetcher != nil && s.deepSeekQuotaFetcher.CanFetch(account) {
+		usage, err := s.getDeepSeekUsage(ctx, account, forceProbe)
+		if err == nil {
+			s.tryClearRecoverableAccountError(ctx, account)
+		}
+		return usage, err
 	}
 
 	if account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
@@ -1013,6 +1036,75 @@ func (s *AccountUsageService) getGeminiUsage(ctx context.Context, account *Accou
 	}
 
 	return usage, nil
+}
+
+// getDeepSeekUsage 获取 DeepSeek 账号余额（带缓存 + singleflight）。
+func (s *AccountUsageService) getDeepSeekUsage(ctx context.Context, account *Account, force bool) (*UsageInfo, error) {
+	now := time.Now()
+	usage := &UsageInfo{UpdatedAt: &now}
+	if account == nil || s.deepSeekQuotaFetcher == nil {
+		return usage, nil
+	}
+
+	// 缓存 key
+	cacheKey := fmt.Sprintf("deepseek-balance:%d", account.ID)
+	if cached, ok := s.cache.deepSeekCache.Load(account.ID); ok {
+		if c, ok := cached.(*deepSeekUsageCache); ok && !force {
+			ttl := deepSeekBalanceCacheTTL(c.usageInfo)
+			if time.Since(c.timestamp) < ttl {
+				return c.usageInfo, nil
+			}
+		}
+	}
+
+	flightKey := cacheKey
+	result, flightErr, _ := s.cache.deepSeekFlight.Do(flightKey, func() (any, error) {
+		if cached, ok := s.cache.deepSeekCache.Load(account.ID); ok {
+			if c, ok := cached.(*deepSeekUsageCache); ok && !force {
+				ttl := deepSeekBalanceCacheTTL(c.usageInfo)
+				if time.Since(c.timestamp) < ttl {
+					return c.usageInfo, nil
+				}
+			}
+		}
+		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer fetchCancel()
+		proxyURL := s.deepSeekQuotaFetcher.GetProxyURL(fetchCtx, account)
+		fetchResult, err := s.deepSeekQuotaFetcher.FetchQuota(fetchCtx, account, proxyURL)
+		if err != nil {
+			degraded := &UsageInfo{UpdatedAt: &now, ErrorCode: "network_error", Error: err.Error()}
+			enrichUsageWithAccountError(degraded, account)
+			s.cache.deepSeekCache.Store(account.ID, &deepSeekUsageCache{usageInfo: degraded, timestamp: time.Now()})
+			return degraded, nil
+		}
+		enrichUsageWithAccountError(fetchResult.UsageInfo, account)
+		if fetchResult.Raw != nil {
+			mergeAccountExtra(account, map[string]any{"deepseek_balance_snapshot": fetchResult.Raw})
+		}
+		s.cache.deepSeekCache.Store(account.ID, &deepSeekUsageCache{usageInfo: fetchResult.UsageInfo, timestamp: time.Now()})
+		return fetchResult.UsageInfo, nil
+	})
+	if flightErr != nil {
+		return usage, nil
+	}
+	if u, ok := result.(*UsageInfo); ok && u != nil {
+		return u, nil
+	}
+	return usage, nil
+}
+
+// deepSeekUsageCache 缓存项
+type deepSeekUsageCache struct {
+	usageInfo *UsageInfo
+	timestamp time.Time
+}
+
+// deepSeekBalanceCacheTTL DeepSeek 余额缓存时长（成功 5 分钟 / 错误 1 分钟）。
+func deepSeekBalanceCacheTTL(usage *UsageInfo) time.Duration {
+	if usage == nil || usage.ErrorCode != "" {
+		return 1 * time.Minute
+	}
+	return 5 * time.Minute
 }
 
 // getAntigravityUsage 获取 Antigravity 账户额度
