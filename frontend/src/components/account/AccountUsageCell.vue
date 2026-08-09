@@ -194,6 +194,40 @@
       </div>
     </template>
 
+    <!-- DeepSeek API Key accounts: show balance from official /user/balance API -->
+    <template v-else-if="account.platform === 'openai' && account.type === 'apikey' && isDeepSeekAccount">
+      <!-- Loading state -->
+      <div v-if="loading" class="space-y-1.5">
+        <div class="h-3 w-24 animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
+      </div>
+      <!-- Error state -->
+      <div v-else-if="error" class="text-xs text-red-500">{{ error }}</div>
+      <!-- Balance data -->
+      <div v-else-if="deepSeekBalance" class="space-y-1">
+        <div class="flex items-center gap-1">
+          <span class="badge text-xs px-2 py-0.5 rounded font-medium bg-sky-100 text-sky-600 dark:bg-sky-900/40 dark:text-sky-300">
+            DeepSeek 余额
+          </span>
+          <span
+            v-if="deepSeekBalance.is_available"
+            class="text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
+          >Available</span>
+          <span v-else class="text-[10px] font-medium text-red-500">Unavailable</span>
+        </div>
+        <div
+          v-for="b in deepSeekBalance.balance_infos"
+          :key="b.currency"
+          class="flex items-center gap-1 text-xs"
+        >
+          <span class="font-medium text-gray-800 dark:text-gray-200">{{ b.currency }}</span>
+          <span class="font-medium text-gray-800 dark:text-gray-200">{{ b.total_balance }}</span>
+          <span class="text-[10px] text-gray-400">
+            充值 {{ b.topped_up_balance }} · 赠送 {{ b.granted_balance }}
+          </span>
+        </div>
+      </div>
+    </template>
+
     <!-- Antigravity OAuth accounts: fetch usage from API -->
     <template v-else-if="account.platform === 'antigravity' && account.type === 'oauth'">
       <!-- 账户类型徽章 -->
@@ -687,10 +721,24 @@ let desktopViewportMediaQuery: MediaQueryList | null = null
 let desktopViewportListener: ((event: MediaQueryListEvent) => void) | null = null
 let visibilityObserver: IntersectionObserver | null = null
 
+// 是否为 DeepSeek API Key 账号（后端在 account.extra 注入 deepseek_balance_supported 标记）
+const isDeepSeekAccount = computed(() => {
+  return (
+    props.account.platform === 'openai' &&
+    props.account.type === 'apikey' &&
+    (props.account.extra as Record<string, unknown> | undefined)?.deepseek_balance_supported === true
+  )
+})
+
+// DeepSeek 余额（来自官方 /user/balance，经 usageInfo.deepseek_balance 返回）
+const deepSeekBalance = computed(() => usageInfo.value?.deepseek_balance || null)
+
 // Show usage windows for OAuth and Setup Token accounts
 const showUsageWindows = computed(() => {
   // Gemini: we can always compute local usage windows from DB logs (simulated quotas).
   if (props.account.platform === 'gemini') return true
+  // DeepSeek API Key 账号显示余额
+  if (isDeepSeekAccount.value) return true
   return props.account.type === 'oauth' || props.account.type === 'setup-token'
 })
 
@@ -708,7 +756,7 @@ const shouldFetchUsage = computed(() => {
     return props.account.type === 'oauth'
   }
   if (props.account.platform === 'openai') {
-    return props.account.type === 'oauth'
+    return props.account.type === 'oauth' || isDeepSeekAccount.value
   }
   return false
 })
